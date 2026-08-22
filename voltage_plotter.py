@@ -8,18 +8,21 @@ modeled after CellGraphingNotebook.ipynb (the voltage-plotting portion).
 Features
 --------
 * Drag & drop (or browse for) exported .txt data files.
+* Plot voltage vs time, or voltage vs capacity with a selectable cycle range.
 * Toggle each file's visibility, rename its legend label, recolor it, remove it.
 * Customize the axes: title, axis labels, x/y limits, line width, legend,
   figure size, and plot style.
 * Add points of interest (e.g. critical current density) with an arrow-annotated
-  label.  If you give a point a critical current (mA), the label auto-computes the
-  critical current density (CCD) using the lithium electrode area.
+  label.  Tick "Calculate CCD" and the label auto-computes the critical current
+  density from the point's time via the current schedule and electrode area.
 * Input parameters like the lithium electrode diameter are fully customizable and
   feed the CCD calculation live.
 * Save the figure to PNG/PDF/SVG.
 
-Data format (matches the notebook): one header row, then comma-separated
-``TestTime/h,Voltage/V`` rows.
+Data formats (one header row, comma-separated), auto-detected by header name:
+  * ``TestTime/h,Voltage/V`` — voltage vs time only, and
+  * ``TestTime/h,Current/mA,Capacity/mAh,Voltage/V,CycleNo`` — also enables the
+    voltage-vs-capacity plot and cycle-range selection.
 
 Run with the interpreter that has matplotlib / numpy / tkinterdnd2 installed, e.g.::
 
@@ -57,7 +60,13 @@ DEFAULT_COLORS = ["red", "orange", "yellow", "green", "blue", "purple",
 # Data model
 # ---------------------------------------------------------------------------
 class CellFile:
-    """One loaded .txt data file (time in hours, voltage in volts)."""
+    """One loaded .txt data file.
+
+    Two export formats are supported, distinguished by their header:
+      * ``TestTime/h,Voltage/V`` (voltage vs time only), and
+      * ``TestTime/h,Current/mA,Capacity/mAh,Voltage/V,CycleNo`` which also
+        carries current, capacity, and cycle number.
+    Missing columns are stored as ``None``."""
 
     def __init__(self, path, label, color):
         self.path = path
@@ -65,19 +74,42 @@ class CellFile:
         self.color = color
         self.visible = True
         self.linewidth = 0.5
-        self.time, self.volt = self._load(path)
+        # time, volt, current, capacity, cycle (any of the last three may be None)
+        self.time = self.volt = self.current = self.capacity = self.cycle = None
+        self._load(path)
 
-    @staticmethod
-    def _load(path):
-        # Header row + comma-separated numeric columns, as exported.
+    def _load(self, path):
+        # Read the header so columns can be located by name (order-independent).
+        with open(path) as fh:
+            header = fh.readline().strip()
+        cols = [c.strip() for c in header.split(",")]
+        idx = {name: i for i, name in enumerate(cols)}
+
         data = np.loadtxt(path, skiprows=1, delimiter=",")
         data = np.atleast_2d(data)
-        time, volt = data[:, 0], data[:, 1]
+
+        def col(name, positional=None):
+            if name in idx:
+                return data[:, idx[name]]
+            if positional is not None and data.shape[1] > positional:
+                return data[:, positional]
+            return None
+
+        # Fall back to positional [time, voltage] for headerless/renamed 2-col files.
+        self.time = col("TestTime/h", positional=0)
+        self.volt = col("Voltage/V", positional=1)
+        self.current = col("Current/mA")
+        self.capacity = col("Capacity/mAh")
+        self.cycle = col("CycleNo")
+
         # Omitted resting time can make the first point start at, e.g., t=20.
         # Shift so every trace begins at t=0 by subtracting its first timestamp.
-        if time.size:
-            time = time - time[0]
-        return time, volt
+        if self.time is not None and self.time.size:
+            self.time = self.time - self.time[0]
+
+    @property
+    def has_capacity(self):
+        return self.capacity is not None
 
 
 class POI:
@@ -246,6 +278,19 @@ class VoltagePlotterApp:
         self._bottom_block.scroll(wheel_steps(event))
         return "break"
 
+    def _on_mode_change(self):
+        """React to switching between Voltage-vs-Time and Voltage-vs-Capacity."""
+        capacity = self.plot_mode.get() == "capacity"
+        # Cycle-range fields only apply to the capacity plot.
+        state = "normal" if capacity else "disabled"
+        self.cyc_from_entry.configure(state=state)
+        self.cyc_to_entry.configure(state=state)
+        # Update the x-axis label to match the mode.
+        if hasattr(self, "xlabel_var"):
+            self.xlabel_var.set("Capacity / mAh" if capacity else "Time / hour")
+        if hasattr(self, "canvas"):
+            self.redraw()
+
     def _fit_to_screen(self):
         """Open expanded to fill the usable screen (below the menu bar), not
         fullscreen and not overlapping the macOS menu bar."""
@@ -350,6 +395,35 @@ class VoltagePlotterApp:
                         variable=self.discharge_first,
                         command=self.redraw).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 3))
+
+        # ---- Plot type (bottom block) ----
+        ptype = ttk.LabelFrame(c, text="Plot type")
+        ptype.pack(fill="x", padx=8, pady=4)
+        self.plot_mode = tk.StringVar(value="time")
+        ttk.Radiobutton(ptype, text="Voltage vs Time", variable=self.plot_mode,
+                        value="time", command=self._on_mode_change).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=1)
+        ttk.Radiobutton(ptype, text="Voltage vs Capacity", variable=self.plot_mode,
+                        value="capacity", command=self._on_mode_change).grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=4, pady=1)
+
+        ttk.Label(ptype, text="Cycles (from, to):").grid(
+            row=2, column=0, sticky="w", padx=4, pady=2)
+        self.cyc_from = tk.StringVar(value="")
+        self.cyc_to = tk.StringVar(value="")
+        self.cyc_from_entry = ttk.Entry(ptype, textvariable=self.cyc_from, width=6)
+        self.cyc_to_entry = ttk.Entry(ptype, textvariable=self.cyc_to, width=6)
+        self.cyc_from_entry.grid(row=2, column=1, sticky="w", padx=2)
+        self.cyc_to_entry.grid(row=2, column=2, sticky="w", padx=2)
+        for e in (self.cyc_from_entry, self.cyc_to_entry):
+            e.bind("<FocusOut>", lambda _e: self.redraw())
+            e.bind("<Return>", lambda _e: self.redraw())
+        ttk.Label(ptype, text="(blank = all cycles; capacity mode only)",
+                  foreground="#888").grid(row=3, column=0, columnspan=3,
+                                          sticky="w", padx=4)
+        # Start in time mode: cycle range not applicable, so disable it.
+        self.cyc_from_entry.configure(state="disabled")
+        self.cyc_to_entry.configure(state="disabled")
 
         # ---- Axes / appearance ----
         axes = ttk.LabelFrame(c, text="Axes & appearance")
@@ -752,10 +826,14 @@ class VoltagePlotterApp:
         except ValueError:
             default_lw = 0.5
 
-        for f in self.files:
-            if not f.visible:
-                continue
-            ax.plot(f.time, f.volt, lw=default_lw, c=f.color, label=f.label)
+        capacity_mode = self.plot_mode.get() == "capacity"
+        if capacity_mode:
+            self._draw_capacity(ax, default_lw)
+        else:
+            for f in self.files:
+                if not f.visible:
+                    continue
+                ax.plot(f.time, f.volt, lw=default_lw, c=f.color, label=f.label)
 
         # Points of interest.
         for p in self.pois:
@@ -805,6 +883,28 @@ class VoltagePlotterApp:
             ax.grid(True, alpha=0.3)
         if self.show_legend.get() and any(f.visible for f in self.files):
             ax.legend()
+
+    def _draw_capacity(self, ax, default_lw):
+        """Plot voltage vs capacity, one segment per cycle within the selected
+        cycle range (blank = all).  Each cycle is drawn separately so the trace
+        lifts between cycles instead of jumping back when capacity resets."""
+        lo = self._parse(self.cyc_from)
+        hi = self._parse(self.cyc_to)
+        for f in self.files:
+            if not f.visible or not f.has_capacity:
+                continue
+            cap, volt, cyc = f.capacity, f.volt, f.cycle
+            if cyc is None:
+                ax.plot(cap, volt, lw=default_lw, c=f.color, label=f.label)
+                continue
+            cycles = [c for c in np.unique(cyc)
+                      if (lo is None or c >= lo) and (hi is None or c <= hi)]
+            first = True
+            for cn in cycles:
+                m = cyc == cn
+                ax.plot(cap[m], volt[m], lw=default_lw, c=f.color,
+                        label=(f.label if first else None))
+                first = False
 
     def _build_export_figure(self, li_area, w, h):
         """Figure whose *plot area* (axes) is exactly ``w`` x ``h`` inches.
